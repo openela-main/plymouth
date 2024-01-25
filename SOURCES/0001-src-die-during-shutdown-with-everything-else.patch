@@ -1,0 +1,871 @@
+From f55051678452647e035853ee94a89cb54ea2aa4a Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Fri, 17 Jul 2020 16:06:44 -0400
+Subject: [PATCH] src: die during shutdown with everything else
+
+plymouthd currently avoids getting killed at shutdown.  This causes
+filesystems to fail to remount read-only in some cases.
+
+This commit changes things up so that plymouthd dies with everyone else,
+but spawns a process to hold open the drm device that can keep the splash
+up until the very end.
+
+In order to keep this process alive until the very end, it gets run
+from within the initramfs (if available).  This requires adding service
+files to jump back into the initramfs at shutdown
+---
+ configure.ac                                  |  1 +
+ scripts/plymouth-populate-initrd.in           |  2 +
+ src/Makefile.am                               |  7 +++
+ src/main.c                                    | 11 +++-
+ src/plugins/renderers/drm/Makefile.am         |  3 +-
+ src/plugins/renderers/drm/plugin.c            | 62 +++++++++++++++++++
+ src/plymouthd-drm-escrow.c                    | 18 ++++++
+ systemd-units/Makefile.am                     | 28 ++++++---
+ systemd-units/plymouth-halt.service.in        |  1 +
+ systemd-units/plymouth-poweroff.service.in    |  1 +
+ systemd-units/plymouth-reboot.service.in      |  1 +
+ .../plymouth-switch-root-initramfs.service.in | 12 ++++
+ 12 files changed, 134 insertions(+), 13 deletions(-)
+ create mode 100644 src/plymouthd-drm-escrow.c
+ create mode 100644 systemd-units/plymouth-switch-root-initramfs.service.in
+
+diff --git a/configure.ac b/configure.ac
+index 970e19f..1dc8cdb 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -319,36 +319,37 @@ AC_CONFIG_FILES([Makefile po/Makefile.in
+            src/plugins/controls/label/Makefile
+            src/Makefile
+            src/client/ply-boot-client.pc
+            src/client/Makefile
+            src/upstart-bridge/Makefile
+            themes/Makefile
+            themes/spinfinity/Makefile
+            themes/fade-in/Makefile
+            themes/tribar/Makefile
+            themes/text/Makefile
+            themes/details/Makefile
+            themes/solar/Makefile
+            themes/glow/Makefile
+            themes/spinner/Makefile
+            themes/script/Makefile
+            themes/bgrt/Makefile
+            images/Makefile
+ 	   scripts/plymouth-generate-initrd
+ 	   scripts/plymouth-populate-initrd
+ 	   scripts/plymouth-set-default-theme
+            scripts/Makefile
+            systemd-units/plymouth-halt.service
+            systemd-units/plymouth-kexec.service
+            systemd-units/plymouth-poweroff.service
+            systemd-units/plymouth-quit.service
+            systemd-units/plymouth-quit-wait.service
+            systemd-units/plymouth-read-write.service
+            systemd-units/plymouth-reboot.service
+            systemd-units/plymouth-start.service
+            systemd-units/plymouth-switch-root.service
++           systemd-units/plymouth-switch-root-initramfs.service
+            systemd-units/systemd-ask-password-plymouth.path
+            systemd-units/systemd-ask-password-plymouth.service
+            systemd-units/Makefile
+            docs/Makefile
+ ])
+ AC_OUTPUT
+diff --git a/scripts/plymouth-populate-initrd.in b/scripts/plymouth-populate-initrd.in
+index 60fd063..535a896 100755
+--- a/scripts/plymouth-populate-initrd.in
++++ b/scripts/plymouth-populate-initrd.in
+@@ -1,54 +1,55 @@
+ #!/bin/bash
+ #
+ # inst bits ruthlessly and viciously stolen from dracut
+ 
+ [ -z "$DESTDIR" ] || exit 0
+ 
+ # For running on a (cross-compiled) sysroot, the following
+ # settings are needed:
+ # PLYMOUTH_SYSROOT - the sysroot directory
+ # PLYMOUTH_LDD - an optional ldd command that works on foreign binaries
+ # PLYMOUTH_LDD_PATH - optional PATH ldd is run with
+ 
+ [ -z "$PLYMOUTH_LDD" ] && PLYMOUTH_LDD="ldd"
+ [ -z "$PLYMOUTH_LDD_PATH" ] && PLYMOUTH_LDD_PATH="$PATH"
+ [ -z "$PLYMOUTH_LIBEXECDIR" ] && PLYMOUTH_LIBEXECDIR="@PLYMOUTH_LIBEXECDIR@"
+ [ -z "$PLYMOUTH_DATADIR" ] && PLYMOUTH_DATADIR="@PLYMOUTH_DATADIR@"
+ [ -z "$PLYMOUTH_PLUGIN_PATH" ] && PLYMOUTH_PLUGIN_PATH="$(plymouth --get-splash-plugin-path)"
+ [ -z "$PLYMOUTH_LOGO_FILE" ] && PLYMOUTH_LOGO_FILE="@PLYMOUTH_LOGO_FILE@"
+ [ -n "$PLYMOUTH_THEME_NAME" ] && THEME_OVERRIDE=1
+ [ -z "$PLYMOUTH_THEME_NAME" ] && PLYMOUTH_THEME_NAME=$(plymouth-set-default-theme)
+ [ -z "$PLYMOUTH_CONFDIR" ] && PLYMOUTH_CONFDIR="@PLYMOUTH_CONF_DIR@"
+ [ -z "$PLYMOUTH_POLICYDIR" ] && PLYMOUTH_POLICYDIR="@PLYMOUTH_POLICY_DIR@"
+ [ -z "$PLYMOUTH_DAEMON_PATH" ] && PLYMOUTH_DAEMON_PATH="@PLYMOUTH_DAEMON_DIR@/plymouthd"
+ [ -z "$PLYMOUTH_CLIENT_PATH" ] && PLYMOUTH_CLIENT_PATH="@PLYMOUTH_CLIENT_DIR@/plymouth"
++[ -z "$PLYMOUTH_DRM_ESCROW_PATH" ] && PLYMOUTH_DRM_ESCROW_PATH="@PLYMOUTH_LIBEXECDIR@/plymouth/plymouth-drm-escrow"
+ [ -z "$SYSTEMD_UNIT_DIR" ] && SYSTEMD_UNIT_DIR="@SYSTEMD_UNIT_DIR@"
+ [ -z "$SUPPORTED_LANGUAGES" ] && SUPPORTED_LANGUAGES="pt fr de it ru es en zh ja ko zh as bn gu hi kn ml mr or pa ta te"
+ 
+ # Generic substring function.  If $2 is in $1, return 0.
+ strstr() { [ "${1#*$2*}" != "$1" ]; }
+ 
+ ddebug() {
+     [ "$verbose" = "true" ] && echo "$@"
+ }
+ 
+ # normalize_path <path>
+ # Prints the normalized path, where it removes any duplicated
+ # and trailing slashes.
+ # Example:
+ # $ normalize_path ///test/test//
+ # /test/test
+ normalize_path() {
+     shopt -q -s extglob
+     set -- "${1//+(\/)//}"
+     shopt -q -u extglob
+     echo "${1%/}"
+ }
+ 
+ # convert_abs_rel <from> <to>
+ # Prints the relative path, when creating a symlink to <to> from <from>.
+ # Example:
+ # $ convert_abs_rel /usr/bin/test /bin/test-2
+ # ../../bin/test-2
+ # $ ln -s $(convert_abs_rel /usr/bin/test /bin/test-2) /usr/bin/test
+ convert_abs_rel() {
+@@ -390,60 +391,61 @@ verbose=false
+ INITRDDIR=""
+ while [ $# -gt 0 ]; do
+     case $1 in
+         --verbose|-v)
+             verbose=true
+             ;;
+         --targetdir|-t)
+             shift
+             INITRDDIR="$1"
+             ;;
+         --help|-h)
+             usage normal
+             ;;
+         *)
+             usage error
+             break
+             ;;
+     esac
+     shift
+ done
+ 
+ [ -z "$INITRDDIR" ] && usage error
+ 
+ ddebug "Running with PLYMOUTH_SYSROOT=$PLYMOUTH_SYSROOT"
+ ddebug "Running with PLYMOUTH_LDD=$PLYMOUTH_LDD"
+ ddebug "Running with PLYMOUTH_LDD_PATH=$PLYMOUTH_LDD_PATH"
+ 
+ mkdir -p ${INITRDDIR}${PLYMOUTH_DATADIR}/plymouth/themes
+ inst ${PLYMOUTH_DAEMON_PATH} $INITRDDIR
+ inst ${PLYMOUTH_CLIENT_PATH} $INITRDDIR
++inst ${PLYMOUTH_DRM_ESCROW_PATH} $INITRDDIR
+ inst ${PLYMOUTH_DATADIR}/plymouth/themes/text/text.plymouth $INITRDDIR
+ inst ${PLYMOUTH_PLUGIN_PATH}/text.so $INITRDDIR
+ inst ${PLYMOUTH_DATADIR}/plymouth/themes/details/details.plymouth $INITRDDIR
+ inst ${PLYMOUTH_PLUGIN_PATH}/details.so $INITRDDIR
+ inst ${PLYMOUTH_LOGO_FILE} $INITRDDIR
+ inst @RELEASE_FILE@ $INITRDDIR
+ inst ${PLYMOUTH_POLICYDIR}/plymouthd.defaults $INITRDDIR
+ inst ${PLYMOUTH_CONFDIR}/plymouthd.conf $INITRDDIR
+ 
+ if [ -z "$PLYMOUTH_THEME_NAME" ]; then
+     echo "No default plymouth plugin is set" >&2
+     exit 1
+ fi
+ 
+ if [ $THEME_OVERRIDE ]; then
+     conf=$INITRDDIR/${PLYMOUTH_CONFDIR}/plymouthd.conf
+     echo "modifying plymouthd.conf: Theme=$PLYMOUTH_THEME_NAME" >&2
+     # make sure the section and key exist so we can modify them
+     grep -q "^ *\[Daemon\]" $conf || echo "[Daemon]" >> $conf
+     grep -q "^ *Theme *=" $conf || echo "Theme=fade-in" >> $conf
+     sed -i "s/^ *Theme *=.*/# theme modified by plymouth-populate-initrd\nTheme=$PLYMOUTH_THEME_NAME/" $conf
+ fi
+ 
+ PLYMOUTH_MODULE_NAME=$(grep "ModuleName *= *" ${PLYMOUTH_SYSROOT}${PLYMOUTH_DATADIR}/plymouth/themes/${PLYMOUTH_THEME_NAME}/${PLYMOUTH_THEME_NAME}.plymouth | sed 's/ModuleName *= *//')
+ PLYMOUTH_THEME_DIR="${PLYMOUTH_DATADIR}/plymouth/themes/${PLYMOUTH_THEME_NAME}"
+ PLYMOUTH_IMAGE_DIR=$(grep "ImageDir *= *" ${PLYMOUTH_SYSROOT}${PLYMOUTH_THEME_DIR}/${PLYMOUTH_THEME_NAME}.plymouth | sed 's/ImageDir *= *//')
+ 
+ if [ ! -f ${PLYMOUTH_SYSROOT}${PLYMOUTH_PLUGIN_PATH}/${PLYMOUTH_MODULE_NAME}.so ]; then
+     echo "The default plymouth plugin (${PLYMOUTH_MODULE_NAME}) doesn't exist" >&2
+     exit 1
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 95ed019..78f3f78 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -1,52 +1,59 @@
+ SUBDIRS = libply libply-splash-core libply-splash-graphics . plugins client
+ if ENABLE_UPSTART_MONITORING
+ SUBDIRS += upstart-bridge
+ endif
+ AM_CPPFLAGS = -I$(top_srcdir)                                                 \
+            -I$(srcdir)/libply                                                 \
+            -I$(srcdir)/libply-splash-core                                     \
+            -I$(srcdir)                                                        \
++           -DPLYMOUTH_DRM_ESCROW_DIRECTORY=\"$(libexecdir)/plymouth\"         \
+            -DPLYMOUTH_LOG_DIRECTORY=\"$(localstatedir)/log\"                  \
+            -DPLYMOUTH_SPOOL_DIRECTORY=\"$(localstatedir)/spool/plymouth\"     \
+            -DPLYMOUTH_TIME_DIRECTORY=\"$(localstatedir)/lib/plymouth/\"       \
+            -DPLYMOUTH_LOGO_FILE=\"$(logofile)\"
+ 
+ plymouthdbindir = $(plymouthdaemondir)
+ plymouthdbin_PROGRAMS = plymouthd
+ 
+ plymouthd_CFLAGS = $(PLYMOUTH_CFLAGS)                                         \
+ 		   -rdynamic                                                  \
+ 		   -DPLYMOUTH_PLUGIN_PATH=\"$(PLYMOUTH_PLUGIN_PATH)\"         \
+ 		   -DPLYMOUTH_THEME_PATH=\"$(PLYMOUTH_THEME_PATH)/\"          \
+ 		   -DPLYMOUTH_POLICY_DIR=\"$(PLYMOUTH_POLICY_DIR)/\"          \
+ 		   -DPLYMOUTH_RUNTIME_DIR=\"$(PLYMOUTH_RUNTIME_DIR)\"         \
+ 		   -DPLYMOUTH_CONF_DIR=\"$(PLYMOUTH_CONF_DIR)/\"              \
+ 		   -DPLYMOUTH_RUNTIME_THEME_PATH=\"$(PLYMOUTH_RUNTIME_THEME_PATH)/\"
+ plymouthd_LDADD = $(PLYMOUTH_LIBS) libply/libply.la libply-splash-core/libply-splash-core.la
+ plymouthd_SOURCES =                                                            \
+                    ply-boot-protocol.h                                        \
+                    ply-boot-server.h                                          \
+                    ply-boot-server.c                                          \
+                    plugins/splash/details/plugin.c                  \
+                    main.c
+ 
++escrowdir = $(libexecdir)/plymouth
++escrow_PROGRAMS = plymouthd-drm-escrow
++
++plymouthd_drm_escrow_LDFLAGS = -all-static
++plymouthd_drm_escrow_SOURCES = plymouthd-drm-escrow.c
++
+ plymouthdrundir = $(localstatedir)/run/plymouth
+ plymouthdspooldir = $(localstatedir)/spool/plymouth
+ plymouthdtimedir = $(localstatedir)/lib/plymouth
+ 
+ pkgconfigdir = $(libdir)/pkgconfig
+ pkgconfig_DATA = ply-splash-core.pc ply-splash-graphics.pc
+ 
+ plymouthd_defaultsdir = $(PLYMOUTH_POLICY_DIR)
+ dist_plymouthd_defaults_DATA = plymouthd.defaults
+ 
+ plymouthd_confdir = $(PLYMOUTH_CONF_DIR)
+ dist_plymouthd_conf_DATA = plymouthd.conf
+ 
+ install-data-hook:
+ 	-mkdir -p $(DESTDIR)$(plymouthdrundir)
+ 	-mkdir -p $(DESTDIR)$(plymouthdspooldir)
+ 	-mkdir -p $(DESTDIR)$(plymouthdtimedir)
+ 
+ EXTRA_DIST = ply-splash-core.pc.in ply-splash-graphics.pc.in
+ MAINTAINERCLEANFILES = Makefile.in
+diff --git a/src/main.c b/src/main.c
+index 8848ad0..8372f2f 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -2181,65 +2181,70 @@ main (int    argc,
+ 
+                 if (daemon_handle == NULL) {
+                         ply_error ("plymouthd: cannot daemonize: %m");
+                         return EX_UNAVAILABLE;
+                 }
+         }
+ 
+         if (debug)
+                 debug_buffer = ply_buffer_new ();
+ 
+         signal (SIGABRT, on_crash);
+         signal (SIGSEGV, on_crash);
+ 
+         /* before do anything we need to make sure we have a working
+          * environment.
+          */
+         if (!initialize_environment (&state)) {
+                 if (errno == 0) {
+                         if (daemon_handle != NULL)
+                                 ply_detach_daemon (daemon_handle, 0);
+                         return 0;
+                 }
+ 
+                 ply_error ("plymouthd: could not setup basic operating environment: %m");
+                 if (daemon_handle != NULL)
+                         ply_detach_daemon (daemon_handle, EX_OSERR);
+                 return EX_OSERR;
+         }
+ 
+         /* Make the first byte in argv be '@' so that we can survive systemd's killing
+-         * spree when going from initrd to /, and so we stay alive all the way until
+-         * the power is killed at shutdown.
++         * spree when going from initrd to /
+          * http://www.freedesktop.org/wiki/Software/systemd/RootStorageDaemons
++         *
++         * If the system is shutting down, we let systemd slay us because otherwise we
++         * may prevent the root fs from getting remounted read-only.
+          */
+-        argv[0][0] = '@';
++        if (state.mode != PLY_BOOT_SPLASH_MODE_SHUTDOWN &&
++	    state.mode != PLY_BOOT_SPLASH_MODE_REBOOT) {
++                argv[0][0] = '@';
++        }
+ 
+         state.boot_server = start_boot_server (&state);
+ 
+         if (state.boot_server == NULL) {
+                 ply_trace ("plymouthd is already running");
+ 
+                 if (daemon_handle != NULL)
+                         ply_detach_daemon (daemon_handle, EX_OK);
+                 return EX_OK;
+         }
+ 
+         state.boot_buffer = ply_buffer_new ();
+ 
+         if (attach_to_session) {
+                 state.should_be_attached = attach_to_session;
+                 if (!attach_to_running_session (&state)) {
+                         ply_trace ("could not redirect console session: %m");
+                         if (!no_daemon)
+                                 ply_detach_daemon (daemon_handle, EX_UNAVAILABLE);
+                         return EX_UNAVAILABLE;
+                 }
+         }
+ 
+         state.progress = ply_progress_new ();
+         state.splash_delay = NAN;
+         state.device_timeout = NAN;
+ 
+         ply_progress_load_cache (state.progress,
+                                  get_cache_file_for_mode (state.mode));
+ 
+diff --git a/src/plugins/renderers/drm/Makefile.am b/src/plugins/renderers/drm/Makefile.am
+index 271b17f..22a819b 100644
+--- a/src/plugins/renderers/drm/Makefile.am
++++ b/src/plugins/renderers/drm/Makefile.am
+@@ -1,23 +1,24 @@
+ if ENABLE_DRM_RENDERER
+ AM_CPPFLAGS = -I$(top_srcdir)                                                 \
+            -I$(srcdir)/../../../libply                                        \
+            -I$(srcdir)/../../../libply-splash-core                            \
+            -I$(srcdir)/../../..                                               \
+            -I$(srcdir)/../..                                                  \
+            -I$(srcdir)/..                                                     \
+-           -I$(srcdir)
++           -I$(srcdir)                                                        \
++           -DPLYMOUTH_DRM_ESCROW_DIRECTORY=\"$(libexecdir)/plymouth\"
+ 
+ plugindir = $(libdir)/plymouth/renderers
+ plugin_LTLIBRARIES = drm.la
+ 
+ drm_la_CFLAGS = $(PLYMOUTH_CFLAGS) $(DRM_CFLAGS)
+ 
+ drm_la_LDFLAGS = -module -avoid-version -export-dynamic
+ drm_la_LIBADD = $(PLYMOUTH_LIBS) $(DRM_LIBS)                                  \
+                          ../../../libply/libply.la                            \
+                          ../../../libply-splash-core/libply-splash-core.la
+ drm_la_SOURCES = $(srcdir)/plugin.c
+ 
+ endif
+ 
+ MAINTAINERCLEANFILES = Makefile.in
+diff --git a/src/plugins/renderers/drm/plugin.c b/src/plugins/renderers/drm/plugin.c
+index 4dbf8da..38bae36 100644
+--- a/src/plugins/renderers/drm/plugin.c
++++ b/src/plugins/renderers/drm/plugin.c
+@@ -131,73 +131,79 @@ typedef struct
+         bool connected;
+         bool uses_hw_rotation;
+ } ply_output_t;
+ 
+ struct _ply_renderer_backend
+ {
+         ply_event_loop_t                *loop;
+         ply_terminal_t                  *terminal;
+ 
+         int                              device_fd;
+         char                            *device_name;
+         drmModeRes                      *resources;
+ 
+         ply_renderer_input_source_t      input_source;
+         ply_list_t                      *heads;
+         ply_hashtable_t                 *heads_by_controller_id;
+ 
+         ply_hashtable_t                 *output_buffers;
+ 
+         ply_output_t                    *outputs;
+         int                              outputs_len;
+         int                              connected_count;
+ 
+         int32_t                          dither_red;
+         int32_t                          dither_green;
+         int32_t                          dither_blue;
+ 
+         uint32_t                         is_active : 1;
+         uint32_t        requires_explicit_flushing : 1;
+         uint32_t                use_preferred_mode : 1;
++        uint32_t          watching_for_termination : 1;
+ 
+         int                              panel_width;
+         int                              panel_height;
+         ply_pixel_buffer_rotation_t      panel_rotation;
+         int                              panel_scale;
+ };
+ 
+ ply_renderer_plugin_interface_t *ply_renderer_backend_get_interface (void);
+ static bool open_input_source (ply_renderer_backend_t      *backend,
+                                ply_renderer_input_source_t *input_source);
+ static void flush_head (ply_renderer_backend_t *backend,
+                         ply_renderer_head_t    *head);
+ 
++static void close_device (ply_renderer_backend_t *backend);
++
++static void watch_for_termination (ply_renderer_backend_t *backend);
++static void stop_watching_for_termination (ply_renderer_backend_t *backend);
++
+ /* A small helper to determine if we should try to keep the current mode
+  * or pick the best mode ourselves, we keep the current mode only if the
+  * user specified a specific mode using video= on the commandline.
+  */
+ static bool
+ should_use_preferred_mode (void)
+ {
+         bool use_preferred_mode = true;
+ 
+         if (ply_kernel_command_line_get_string_after_prefix ("video="))
+                 use_preferred_mode = false;
+ 
+         ply_trace ("should_use_preferred_mode: %d", use_preferred_mode);
+ 
+         return use_preferred_mode;
+ }
+ 
+ static bool
+ ply_renderer_buffer_map (ply_renderer_backend_t *backend,
+                          ply_renderer_buffer_t  *buffer)
+ {
+         struct drm_mode_map_dumb map_dumb_buffer_request;
+         void *map_address;
+ 
+         if (buffer->map_address != MAP_FAILED) {
+                 buffer->map_count++;
+                 return true;
+         }
+ 
+         memset (&map_dumb_buffer_request, 0, sizeof(struct drm_mode_map_dumb));
+@@ -918,158 +924,214 @@ static void
+ destroy_backend (ply_renderer_backend_t *backend)
+ {
+         ply_trace ("destroying renderer backend for device %s", backend->device_name);
+         free_heads (backend);
+ 
+         free (backend->device_name);
+         ply_hashtable_free (backend->output_buffers);
+         ply_hashtable_free (backend->heads_by_controller_id);
+ 
+         free (backend->outputs);
+         free (backend);
+ }
+ 
+ static void
+ activate (ply_renderer_backend_t *backend)
+ {
+         ply_renderer_head_t *head;
+         ply_list_node_t *node;
+ 
+         ply_trace ("taking master and scanning out");
+         backend->is_active = true;
+ 
+         drmSetMaster (backend->device_fd);
+         node = ply_list_get_first_node (backend->heads);
+         while (node != NULL) {
+                 head = (ply_renderer_head_t *) ply_list_node_get_data (node);
+                 /* Flush out any pending drawing to the buffer */
+                 flush_head (backend, head);
+                 node = ply_list_get_next_node (backend->heads, node);
+         }
++
++        watch_for_termination (backend);
+ }
+ 
+ static void
+ deactivate (ply_renderer_backend_t *backend)
+ {
+         ply_trace ("dropping master");
+         drmDropMaster (backend->device_fd);
+         backend->is_active = false;
++
++        stop_watching_for_termination (backend);
+ }
+ 
+ static void
+ on_active_vt_changed (ply_renderer_backend_t *backend)
+ {
+         if (ply_terminal_is_active (backend->terminal)) {
+                 ply_trace ("activating on vt change");
+                 activate (backend);
+         } else {
+                 ply_trace ("deactivating on vt change");
+                 deactivate (backend);
+         }
+ }
+ 
+ static bool
+ load_driver (ply_renderer_backend_t *backend)
+ {
+         int device_fd;
+ 
+         ply_trace ("Opening '%s'", backend->device_name);
+         device_fd = open (backend->device_name, O_RDWR);
+ 
+         if (device_fd < 0) {
+                 ply_trace ("open failed: %m");
+                 return false;
+         }
+ 
+         backend->device_fd = device_fd;
+ 
+         drmDropMaster (device_fd);
+ 
+         return true;
+ }
+ 
+ static void
+ unload_backend (ply_renderer_backend_t *backend)
+ {
+         if (backend == NULL)
+                 return;
+ 
+         ply_trace ("unloading backend");
+ 
+         if (backend->device_fd >= 0) {
+                 drmClose (backend->device_fd);
+                 backend->device_fd = -1;
+         }
+ 
+         destroy_backend (backend);
+         backend = NULL;
+ 
+ }
+ 
++static void
++on_term_signal (ply_renderer_backend_t *backend)
++{
++        pid_t pid;
++
++        ply_trace ("got SIGTERM, launching drm escrow to protect splash, and dying");
++
++        pid = fork();
++
++        if (pid == 0) {
++                const char *argv[] = { PLYMOUTH_DRM_ESCROW_DIRECTORY "/plymouthd-drm-escrow", NULL };
++
++                dup (backend->device_fd);
++                execve (argv[0], (char * const *) argv, NULL);
++
++		ply_trace ("could not launch drm escrow process: %m");
++
++                _exit (1);
++        }
++
++
++	close_device (backend);
++
++        exit (0);
++}
++
++static void
++watch_for_termination (ply_renderer_backend_t *backend)
++{
++        if (backend->watching_for_termination)
++                return;
++
++	ply_trace ("watching for termination signal");
++        ply_event_loop_watch_signal (backend->loop, SIGTERM, (ply_event_handler_t) on_term_signal, backend);
++        backend->watching_for_termination = true;
++}
++
++static void
++stop_watching_for_termination (ply_renderer_backend_t *backend)
++{
++        if (!backend->watching_for_termination)
++                return;
++
++	ply_trace ("stopping watching for termination signal");
++        ply_event_loop_stop_watching_signal (backend->loop, SIGTERM);
++        backend->watching_for_termination = false;
++}
++
+ static bool
+ open_device (ply_renderer_backend_t *backend)
+ {
+         assert (backend != NULL);
+         assert (backend->device_name != NULL);
+ 
+         if (!load_driver (backend))
+                 return false;
+ 
+         if (backend->terminal == NULL)
+                 return true;
+ 
+         if (!ply_terminal_open (backend->terminal)) {
+                 ply_trace ("could not open terminal: %m");
+                 return false;
+         }
+ 
+         if (!ply_terminal_is_vt (backend->terminal)) {
+                 ply_trace ("terminal is not a VT");
+                 ply_terminal_close (backend->terminal);
+                 return false;
+         }
+ 
+         ply_terminal_watch_for_active_vt_change (backend->terminal,
+                                                  (ply_terminal_active_vt_changed_handler_t)
+                                                  on_active_vt_changed,
+                                                  backend);
+ 
++        watch_for_termination (backend);
++
+         return true;
+ }
+ 
+ static void
+ close_device (ply_renderer_backend_t *backend)
+ {
+         ply_trace ("closing device");
+ 
+         free_heads (backend);
+ 
++        stop_watching_for_termination (backend);
++
+         if (backend->terminal != NULL) {
+                 ply_terminal_stop_watching_for_active_vt_change (backend->terminal,
+                                                                  (ply_terminal_active_vt_changed_handler_t)
+                                                                  on_active_vt_changed,
+                                                                  backend);
+         }
+ 
+         unload_backend (backend);
+ }
+ 
+ static void
+ output_get_controller_info (ply_renderer_backend_t *backend,
+                             drmModeConnector       *connector,
+                             ply_output_t           *output)
+ {
+         int i;
+         drmModeEncoder *encoder;
+ 
+         assert (backend != NULL);
+ 
+         output->possible_controllers = 0xffffffff;
+ 
+         for (i = 0; i < connector->count_encoders; i++) {
+                 encoder = drmModeGetEncoder (backend->device_fd,
+                                              connector->encoders[i]);
+ 
+                 if (encoder == NULL)
+                         continue;
+ 
+                 if (encoder->encoder_id == connector->encoder_id && encoder->crtc_id) {
+diff --git a/src/plymouthd-drm-escrow.c b/src/plymouthd-drm-escrow.c
+new file mode 100644
+index 0000000..9097db9
+--- /dev/null
++++ b/src/plymouthd-drm-escrow.c
+@@ -0,0 +1,18 @@
++#include <signal.h>
++#include <unistd.h>
++
++int
++main(int argc, char **argv)
++{
++	signal (SIGTERM, SIG_IGN);
++
++        /* Make the first byte in argv be '@' so that we can survive systemd's killing
++         * spree until the power is killed at shutdown.
++         * http://www.freedesktop.org/wiki/Software/systemd/RootStorageDaemons
++         */
++        argv[0][0] = '@';
++
++        while (pause());
++
++        return 0;
++}
+diff --git a/systemd-units/Makefile.am b/systemd-units/Makefile.am
+index b1d843b..bfede17 100644
+--- a/systemd-units/Makefile.am
++++ b/systemd-units/Makefile.am
+@@ -1,78 +1,88 @@
+ systemd_unit_templates =                                                     \
+         plymouth-switch-root.service.in                                      \
++        plymouth-switch-root-initramfs.service.in                            \
+         plymouth-start.service.in                                            \
+         plymouth-read-write.service.in                                       \
+         plymouth-quit.service.in                                             \
+         plymouth-quit-wait.service.in                                        \
+         plymouth-reboot.service.in                                           \
+         plymouth-kexec.service.in                                            \
+         plymouth-poweroff.service.in                                         \
+         plymouth-halt.service.in                                             \
+         systemd-ask-password-plymouth.path.in                                \
+         systemd-ask-password-plymouth.service.in
+ 
+ if ENABLE_SYSTEMD_INTEGRATION
+ systemdunitdir=$(SYSTEMD_UNIT_DIR)
+ systemdunit_DATA = $(systemd_unit_templates:.in=)
+ 
+ install-data-hook:
+ 	$(MKDIR_P) -m 0755                                                   \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/initrd-switch-root.target.wants\
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/sysinit.target.wants           \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/multi-user.target.wants        \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/reboot.target.wants            \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/kexec.target.wants             \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/poweroff.target.wants          \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/halt.target.wants
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/initrd-switch-root.target.wants && \
+ 		rm -f plymouth-start.service plymouth-switch-root.service && \
+ 		$(LN_S) ../plymouth-start.service &&                         \
+ 		$(LN_S) ../plymouth-switch-root.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/sysinit.target.wants &&            \
+ 		rm -f plymouth-start.service plymouth-read-write.service &&  \
+ 		$(LN_S) ../plymouth-start.service &&                         \
+ 		$(LN_S) ../plymouth-read-write.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/multi-user.target.wants &&         \
+ 		rm -f plymouth-quit.service plymouth-quit-wait.service &&    \
+ 		$(LN_S) ../plymouth-quit.service &&                          \
+ 		$(LN_S) ../plymouth-quit-wait.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/reboot.target.wants &&             \
+-		rm -f plymouth-reboot.service &&                             \
+-		$(LN_S) ../plymouth-reboot.service)
++		rm -f plymouth-reboot.service                                \
++		      plymouth-switch-root-initramfs.service &&              \
++		$(LN_S) ../plymouth-reboot.service &&                        \
++		$(LN_S) ../plymouth-switch-root-initramfs.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/kexec.target.wants &&              \
+ 		rm -f plymouth-kexec.service &&                              \
+ 		$(LN_S) ../plymouth-kexec.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/poweroff.target.wants &&           \
+-		rm -f plymouth-poweroff.service &&                           \
+-		$(LN_S) ../plymouth-poweroff.service)
++		rm -f plymouth-poweroff.service                              \
++		      plymouth-switch-root-initramfs.service &&              \
++		$(LN_S) ../plymouth-poweroff.service &&                      \
++		$(LN_S) ../plymouth-switch-root-initramfs.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/halt.target.wants &&               \
+-		rm -f plymouth-halt.service &&                               \
+-		$(LN_S) ../plymouth-halt.service)
++		rm -f plymouth-halt.service                                  \
++		      plymouth-switch-root-initramfs.service &&              \
++		$(LN_S) ../plymouth-halt.service &&                          \
++		$(LN_S) ../plymouth-switch-root-initramfs.service)
+ 
+ uninstall-hook:
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/initrd-switch-root.target.wants && \
+ 		rm -f plymouth-start.service plymouth-switch-root.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/sysinit.target.wants &&            \
+ 		rm -f plymouth-start.service plymouth-read-write.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/multi-user.target.wants &&         \
+ 		rm -f plymouth-quit.service plymouth-quit-wait.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/reboot.target.wants &&             \
+-		rm -f plymouth-reboot.service)
++		rm -f plymouth-reboot.service                                \
++		      plymouth-switch-root-initramfs.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/kexec.target.wants &&              \
+ 		rm -f plymouth-kexec.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/poweroff.target.wants &&           \
+-		rm -f plymouth-poweroff.service)
++		rm -f plymouth-poweroff.service                              \
++		      plymouth-switch-root-initramfs.service)
+ 	(cd $(DESTDIR)$(SYSTEMD_UNIT_DIR)/halt.target.wants &&               \
+-		rm -f plymouth-halt.service)
++		rm -f plymouth-halt.service                                  \
++		      plymouth-switch-root-initramfs.service)
+ 	rmdir --ignore-fail-on-non-empty                                     \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/sysinit.target.wants           \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/multi-user.target.wants        \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/reboot.target.wants            \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/kexec.target.wants             \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/poweroff.target.wants          \
+ 		$(DESTDIR)$(SYSTEMD_UNIT_DIR)/halt.target.wants
+ 
+ endif
+ 
+ EXTRA_DIST = $(systemd_unit_templates) $(systemdunit_DATA)
+ DISTCLEANFILES=$(systemdunit_DATA)
+diff --git a/systemd-units/plymouth-halt.service.in b/systemd-units/plymouth-halt.service.in
+index cb87c1f..00f7eed 100644
+--- a/systemd-units/plymouth-halt.service.in
++++ b/systemd-units/plymouth-halt.service.in
+@@ -1,13 +1,14 @@
+ [Unit]
+ Description=Show Plymouth Halt Screen
+ After=getty@tty1.service display-manager.service plymouth-start.service
+ Before=systemd-halt.service
+ DefaultDependencies=no
+ ConditionKernelCommandLine=!plymouth.enable=0
+ ConditionVirtualization=!container
+ 
+ [Service]
+ ExecStart=@PLYMOUTH_DAEMON_DIR@/plymouthd --mode=shutdown --attach-to-session
+ ExecStartPost=-@PLYMOUTH_CLIENT_DIR@/plymouth show-splash
++KillMode=none
+ Type=forking
+ RemainAfterExit=yes
+diff --git a/systemd-units/plymouth-poweroff.service.in b/systemd-units/plymouth-poweroff.service.in
+index cf05e47..a1f78eb 100644
+--- a/systemd-units/plymouth-poweroff.service.in
++++ b/systemd-units/plymouth-poweroff.service.in
+@@ -1,13 +1,14 @@
+ [Unit]
+ Description=Show Plymouth Power Off Screen
+ After=getty@tty1.service display-manager.service plymouth-start.service
+ Before=systemd-poweroff.service
+ DefaultDependencies=no
+ ConditionKernelCommandLine=!plymouth.enable=0
+ ConditionVirtualization=!container
+ 
+ [Service]
+ ExecStart=@PLYMOUTH_DAEMON_DIR@/plymouthd --mode=shutdown --attach-to-session
+ ExecStartPost=-@PLYMOUTH_CLIENT_DIR@/plymouth show-splash
++KillMode=none
+ Type=forking
+ RemainAfterExit=yes
+diff --git a/systemd-units/plymouth-reboot.service.in b/systemd-units/plymouth-reboot.service.in
+index 3624550..8fff576 100644
+--- a/systemd-units/plymouth-reboot.service.in
++++ b/systemd-units/plymouth-reboot.service.in
+@@ -1,13 +1,14 @@
+ [Unit]
+ Description=Show Plymouth Reboot Screen
+ After=getty@tty1.service display-manager.service plymouth-start.service
+ Before=systemd-reboot.service
+ DefaultDependencies=no
+ ConditionKernelCommandLine=!plymouth.enable=0
+ ConditionVirtualization=!container
+ 
+ [Service]
+ ExecStart=@PLYMOUTH_DAEMON_DIR@/plymouthd --mode=reboot --attach-to-session
+ ExecStartPost=-@PLYMOUTH_CLIENT_DIR@/plymouth show-splash
++KillMode=none
+ Type=forking
+ RemainAfterExit=yes
+diff --git a/systemd-units/plymouth-switch-root-initramfs.service.in b/systemd-units/plymouth-switch-root-initramfs.service.in
+new file mode 100644
+index 0000000..cb20459
+--- /dev/null
++++ b/systemd-units/plymouth-switch-root-initramfs.service.in
+@@ -0,0 +1,12 @@
++[Unit]
++Description=Tell Plymouth To Jump To initramfs
++DefaultDependencies=no
++After=plymouth-halt.service plymouth-reboot.service plymouth-poweroff.service dracut-shutdown.service
++ConditionPathExists=/run/initramfs/bin/sh
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++ExecStart=-@PLYMOUTH_CLIENT_DIR@/plymouth update-root-fs --new-root-dir=/run/initramfs
++Type=oneshot
++RemainAfterExit=yes
+-- 
+2.26.0
+
