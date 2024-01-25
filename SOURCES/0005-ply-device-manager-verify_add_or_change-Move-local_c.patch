@@ -1,0 +1,103 @@
+From 406376fbe89078678d68392ea76151ecb4f0e30a Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Mon, 28 Feb 2022 16:36:58 +0100
+Subject: [PATCH 5/6] ply-device-manager: verify_add_or_change(): Move
+ local_console_is_text check
+
+Move the local_console_is_text check outside of the
+"if (subsytem == SUBSYSTEM_DRM)" block.
+
+This check is equally relevant for SUBSYSTEM_FRAME_BUFFER.
+
+Note by itself this is a no-op since verify_add_or_change() *always*
+returns false for SUBSYSTEM_FRAME_BUFFER devices.
+
+This is a preparation patch for making verify_add_or_change() not
+return false when manager->device_timeout_elapsed is set.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+---
+ src/libply-splash-core/ply-device-manager.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/libply-splash-core/ply-device-manager.c b/src/libply-splash-core/ply-device-manager.c
+index 6b7ccd6..bff4982 100644
+--- a/src/libply-splash-core/ply-device-manager.c
++++ b/src/libply-splash-core/ply-device-manager.c
+@@ -423,68 +423,68 @@ on_drm_udev_add_or_change (ply_device_manager_t *manager,
+                 /* We also try to create the renderer again on change events,
+                  * renderer creation fails when no outputs are connected and
+                  * this may have changed.
+                  */
+                 create_devices_for_udev_device (manager, device);
+                 return;
+         }
+ 
+         /* Renderer exists, bail if this is not a change event */
+         if (strcmp (action, "change"))
+                 return;
+ 
+         changed = ply_renderer_handle_change_event (renderer);
+         if (changed) {
+                 free_displays_for_renderer (manager, renderer);
+                 create_pixel_displays_for_renderer (manager, renderer);
+         }
+ }
+ 
+ static bool
+ verify_add_or_change (ply_device_manager_t *manager,
+                       const char           *action,
+                       const char           *device_path,
+                       struct udev_device   *device)
+ {
+         const char *subsystem = udev_device_get_subsystem (device);
+ 
+         if (strcmp (action, "add") && strcmp (action, "change"))
+                 return false;
+ 
++        if (manager->local_console_managed && manager->local_console_is_text) {
++                ply_trace ("ignoring since we're already using text splash for local console");
++                return false;
++        }
++
+         subsystem = udev_device_get_subsystem (device);
+ 
+         if (strcmp (subsystem, SUBSYSTEM_DRM) == 0) {
+-                if (manager->local_console_managed && manager->local_console_is_text) {
+-                        ply_trace ("ignoring since we're already using text splash for local console");
+-                        return false;
+-                }
+-
+                 if (!verify_drm_device (device)) {
+                         ply_trace ("ignoring since we only handle SimpleDRM devices after timeout");
+                         return false;
+                 }
+         } else {
+                 ply_trace ("ignoring since we only handle subsystem %s devices after timeout", subsystem);
+                 return false;
+         }
+ 
+         return true;
+ }
+ 
+ static bool
+ duplicate_device_path (ply_list_t *events, const char *device_path)
+ {
+         struct udev_device *device;
+         ply_list_node_t *node;
+ 
+         for (node = ply_list_get_first_node (events);
+              node; node = ply_list_get_next_node (events, node)) {
+                 device = ply_list_node_get_data (node);
+ 
+                 if (strcmp (udev_device_get_devnode (device), device_path) == 0)
+                         return true;
+         }
+ 
+         return false;
+ }
+ 
+ static void
+-- 
+2.37.0.rc1
+

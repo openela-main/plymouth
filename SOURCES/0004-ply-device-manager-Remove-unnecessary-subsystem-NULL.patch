@@ -1,0 +1,88 @@
+From 5a493ef808b769f4ccc4f3acc1ecf048b8e3efdc Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Mon, 28 Feb 2022 16:20:43 +0100
+Subject: [PATCH 4/6] ply-device-manager: Remove unnecessary subsystem != NULL
+ check
+
+The ply-device-manager.c already assumes that the return value of
+udev_device_get_subsystem () is never NULL in many places, including
+in the condition of the "else if" just below the check which is
+being removed.
+
+Remove the one lonely check for it being NULL for consistency.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+---
+ src/libply-splash-core/ply-device-manager.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/libply-splash-core/ply-device-manager.c b/src/libply-splash-core/ply-device-manager.c
+index 015bd70..6b7ccd6 100644
+--- a/src/libply-splash-core/ply-device-manager.c
++++ b/src/libply-splash-core/ply-device-manager.c
+@@ -286,61 +286,61 @@ verify_drm_device (struct udev_device *device)
+          */
+         if (ply_kernel_command_line_has_argument ("nomodeset"))
+                 return true;
+ 
+         /*
+          * Some firmwares leave the panel black at boot. Allow enabling SimpleDRM
+          * use from the cmdline to show something to the user ASAP.
+          */
+         if (ply_kernel_command_line_has_argument ("plymouth.use-simpledrm"))
+                 return true;
+ 
+         return false;
+ }
+ 
+ static bool
+ create_devices_for_udev_device (ply_device_manager_t *manager,
+                                 struct udev_device   *device)
+ {
+         const char *device_path;
+         bool created = false;
+ 
+         device_path = udev_device_get_devnode (device);
+ 
+         if (device_path != NULL) {
+                 const char *subsystem;
+                 ply_renderer_type_t renderer_type = PLY_RENDERER_TYPE_NONE;
+ 
+                 subsystem = udev_device_get_subsystem (device);
+                 ply_trace ("device subsystem is %s", subsystem);
+ 
+-                if (subsystem != NULL && strcmp (subsystem, SUBSYSTEM_DRM) == 0) {
++                if (strcmp (subsystem, SUBSYSTEM_DRM) == 0) {
+                         ply_trace ("found DRM device %s", device_path);
+                         renderer_type = PLY_RENDERER_TYPE_DRM;
+                 } else if (strcmp (subsystem, SUBSYSTEM_FRAME_BUFFER) == 0) {
+                         ply_trace ("found frame buffer device %s", device_path);
+                         if (!fb_device_has_drm_device (manager, device))
+                                 renderer_type = PLY_RENDERER_TYPE_FRAME_BUFFER;
+                         else
+                                 ply_trace ("ignoring, since there's a DRM device associated with it");
+                 }
+ 
+                 if (renderer_type != PLY_RENDERER_TYPE_NONE) {
+                         ply_terminal_t *terminal = NULL;
+ 
+                         if (!manager->local_console_managed) {
+                                 terminal = manager->local_console_terminal;
+                         }
+ 
+                         created = create_devices_for_terminal_and_renderer_type (manager,
+                                                                                  device_path,
+                                                                                  terminal,
+                                                                                  renderer_type);
+                         if (created) {
+                                 if (renderer_type == PLY_RENDERER_TYPE_DRM)
+                                         manager->found_drm_device = 1;
+                                 if (renderer_type == PLY_RENDERER_TYPE_FRAME_BUFFER)
+                                         manager->found_fb_device = 1;
+                         }
+                 }
+         }
+ 
+-- 
+2.37.0.rc1
+
