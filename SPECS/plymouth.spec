@@ -5,7 +5,7 @@
 Summary: Graphical Boot Animation and Logger
 Name: plymouth
 Version: 0.9.5
-Release: 6.%{commitdate}git%{shortcommit}%{?dist}
+Release: 7.%{commitdate}git%{shortcommit}%{?dist}
 License: GPLv2+
 URL: http://www.freedesktop.org/wiki/Software/Plymouth
 
@@ -14,20 +14,24 @@ Source0: https://gitlab.freedesktop.org/jwrdegoede/plymouth/-/archive/%{commit}/
 #Source0: https://gitlab.freedesktop.org/plymouth/plymouth/-/archive/%%{commit}/%%{name}-%%{shortcommit}.tar.gz
 Source2: charge.plymouth
 
-Patch10001: 0001-ply-utils-Reintroduce-ply_string_has_prefix-helper.patch
-Patch10002: 0002-ply-device-manager-Treat-SimpleDRM-drm-devices-as-fb.patch
-Patch10003: 0003-ply-device-manager-Move-verify_drm_device-higher-up-.patch
-Patch10004: 0004-ply-device-manager-Remove-unnecessary-subsystem-NULL.patch
-Patch10005: 0005-ply-device-manager-verify_add_or_change-Move-local_c.patch
-Patch10006: 0006-ply-device-manager-verify_add_or_change-Move-local_c.patch
+Patch: 0001-ply-utils-Reintroduce-ply_string_has_prefix-helper.patch
+Patch: 0002-ply-device-manager-Treat-SimpleDRM-drm-devices-as-fb.patch
+Patch: 0003-ply-device-manager-Move-verify_drm_device-higher-up-.patch
+Patch: 0004-ply-device-manager-Remove-unnecessary-subsystem-NULL.patch
+Patch: 0005-ply-device-manager-verify_add_or_change-Move-local_c.patch
+Patch: 0006-ply-device-manager-verify_add_or_change-Move-local_c.patch
 
 # Upstream has bumped the soname because some obscure symbols were dropped,
 # but we really do not want to change soname in Fedora during a cycle.
 # The only libply* user in Fedora outside this pkg is plymouth-theme-breeze
 # and that does not need the removed symbols.
-Patch6660001: 0001-Revert-configure-bump-so-name.patch
+Patch: 0001-Revert-configure-bump-so-name.patch
 
-Patch9999001: ship-label-plugin-in-initrd.patch
+# Only replay scrollback buffer on VT, not serial console
+# https://bugzilla.redhat.com/show_bug.cgi?id=2032540
+Patch: 0001-details-Don-t-replay-boot-buffer-on-serial-consoles.patch
+
+Patch: ship-label-plugin-in-initrd.patch
 
 BuildRequires: make
 BuildRequires: gcc libtool git
@@ -410,7 +414,11 @@ fi
 
 
 %changelog
-* Wed Nov 16 2022 Ray Strode <rstrode@redhat.com> - 0.9.5-6.20210331git%(c=%{commit}; echo ${c:0:7})
+* Fri Jul 14 2023 Ray Strode <rstrode@redhat.com> - 0.9.5-7.20210331git1ea1020
+- Only replay scrollback buffer on VT, not serial console
+  Resolves: #2032540
+
+* Wed Nov 16 2022 Ray Strode <rstrode@redhat.com> - 0.9.5-6.20210331git1ea1020
 - Backport simpledrm patches from upstream
   Resolves: #2104910
 
