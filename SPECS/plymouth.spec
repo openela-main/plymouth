@@ -10,7 +10,7 @@
 Summary:              Graphical Boot Animation and Logger
 Name:                 plymouth
 Version:              0.9.4
-Release:              11.%{commitdate}git%{shortcommit}%{?dist}
+Release:              12.%{commitdate}git%{shortcommit}%{?dist}
 License:              GPLv2+
 URL:                  http://www.freedesktop.org/wiki/Software/Plymouth
 Group:                System Environment/Base
@@ -450,6 +450,10 @@ fi
 %files system-theme
 
 %changelog
+* Mon Oct 13 2025 Tomas Popela <tpopela@redhat.com> - 0.9.4-12.git1688935
+- Ship plymouth-devel in AppStream
+  Resolves: RHEL-120195
+
 * Tue Feb 22 2022 Ray Strode <rstrode@redhat.com> - 0.9.4-11.git1688935
 - Fix typo in --with-runtimedir argument to actually stop using
   /var/run and instead use /run instead
