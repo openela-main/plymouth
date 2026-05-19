@@ -5,7 +5,7 @@
 Summary: Graphical Boot Animation and Logger
 Name: plymouth
 Version: 0.9.5
-Release: 7.%{commitdate}git%{shortcommit}%{?dist}
+Release: 8.%{commitdate}git%{shortcommit}%{?dist}
 License: GPLv2+
 URL: http://www.freedesktop.org/wiki/Software/Plymouth
 
@@ -414,6 +414,10 @@ fi
 
 
 %changelog
+* Mon Oct 13 2025 Tomas Popela <tpopela@redhat.com> - 0.9.5-8.20210331git1ea1020
+- Ship plymouth-devel in AppStream
+  Resolves: RHEL-120220
+
 * Fri Jul 14 2023 Ray Strode <rstrode@redhat.com> - 0.9.5-7.20210331git1ea1020
 - Only replay scrollback buffer on VT, not serial console
   Resolves: #2032540
